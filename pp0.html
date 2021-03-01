@@ -1,0 +1,719 @@
+<html>
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+    <script>
+        // Artifact repository for PP0 - for more information see
+        // https://github.com/yossioren/pp0
+
+        const COUNT_SWEEPS = true; // if false, measure time. if true, measure how many cache sweeps we get until the clock changes
+        const USE_ARRAYS = true; // if true, use ByteArrays. If false, just use a large string.
+        const USE_WEBSOCKETS = false; // if true, don't measure time directly, use the WebSockets server instead
+
+        // general constants
+        const WEBSOCKET_URL = "ws://cyberlogs.oy.ne.ro:8080/"; 
+
+        // Cache size constants.
+        const CACHE_SETS = 8192; const CACHE_WAYS = 12;
+        const SET_SKIPPING_STEP = 2;
+
+        // To try out COUNT_SWEEPS mode (e.g. on the Tor Browser), 
+        // increase SAMPLING_PERIOD_IN_MS to 100 and reduce MEASUREMENT_COUNT accordingly
+        const MEASUREMENT_COUNT = 10;
+        const SAMPLING_PERIOD_IN_MS = 100;
+
+        const BYTES_PER_MB = 1024 * 1024;
+        const BYTES_PER_LINE = 64;
+        const SETS_PER_PAGE = 64;
+
+        const BASE_EMOJI_CODEPOINT = 0x01f001;
+        const MAX_EMOJI_CODEPOINT = 0x01ffff;
+        const BYTES_PER_UNICODE_CHAR = 3;
+
+        const WEBSOCKET_PROBE_DATA = ".";
+
+        var websocket = {};
+        var PP = {};
+        var resultArray = {};
+
+
+        // Prime and probe.txt object
+        function PrimeProbeTxt(sets, ways) {
+            this.evictionString = arbitraryLengthText(SOURCE_TEXT, sets * ways * BYTES_PER_LINE / BYTES_PER_UNICODE_CHAR);
+            this.codePointToSearchFor = BASE_EMOJI_CODEPOINT;
+            this.positionSum = 0;
+
+            this.probeAllSets = function () {
+                // Move to the next emoji
+                this.codePointToSearchFor++;
+                if (this.codePointToSearchFor == MAX_EMOJI_CODEPOINT) {
+                    this.codePointToSearchFor = BASE_EMOJI_CODEPOINT;
+                }
+
+                // search for it in the text (save the result so it won't get optimized away)
+                this.positionSum +=
+                    this.evictionString.indexOf("aaaaa" + String.fromCodePoint(this.codePointToSearchFor));
+
+            }
+        }
+
+        // Prime and probe object
+        function PrimeProbe(sets, ways) {
+            this.evictionArray = new Uint32Array(32 * BYTES_PER_MB / Uint32Array.BYTES_PER_ELEMENT);
+            this.setHeads = new Array(SETS_PER_PAGE);
+
+            this.probeSet = function (setOffset) {
+                var pointer = this.setHeads[setOffset];
+                var listHead = pointer;
+                do {
+                    pointer = this.evictionArray[pointer];
+                } while (pointer != listHead);
+                return pointer;
+            }
+
+            this.probeSets = function (sets) {
+                // Probe some of the sets in the page
+                for (setOffset in sets) {
+                    this.probeSet(sets[setOffset]);
+                }
+            }
+
+            this.probeAllSets = function () {
+                var p;
+                for (var set = 0; set < SETS_PER_PAGE; set += SET_SKIPPING_STEP) {
+                    p = this.probeSet(set);
+                }
+
+                return p;
+            }
+
+            this.shuffle = function (arrayToShuffle) {
+                var tmp, current, top = arrayToShuffle.length;
+                if (top) while (--top) {
+                    current = Math.floor(Math.random() * (top + 1));
+                    tmp = arrayToShuffle[current];
+                    arrayToShuffle[current] = arrayToShuffle[top];
+                    arrayToShuffle[top] = tmp;
+                }
+
+                return arrayToShuffle;
+            }
+
+            this.createSetHeads = function (sets, ways) {
+                var unshuffledArray = new Uint32Array(sets / SETS_PER_PAGE);
+                var allSetOffset = Math.log2(sets) + 4; // 17 for sets=8192, 16 for sets=4096
+                var i;
+                for (i = 0; i < unshuffledArray.length; i++) {
+                    unshuffledArray[i] = i;
+                }
+
+                // Shuffle the array
+                var shuffledArray = this.shuffle(unshuffledArray);
+
+                // Now write into the eviction buffer
+                var set_index, element_index, line_index;
+                var currentElement, nextElement;
+
+                for (set_index = 0; set_index < SETS_PER_PAGE; set_index++) {
+                    currentElement = (shuffledArray[0] << 10) + (set_index << 4);
+                    this.setHeads[set_index] = currentElement;
+                    for (line_index = 0; line_index < ways; line_index++) {
+                        for (element_index = 0; element_index < sets / SETS_PER_PAGE - 1; element_index++) {
+                            nextElement = (line_index << allSetOffset) + (shuffledArray[element_index + 1] << 10) + (set_index << 4);
+                            this.evictionArray[currentElement] = nextElement;
+                            currentElement = nextElement;
+                        } // element
+
+                        if (line_index == ways - 1) {
+                            // In the last line, the last pointer goes to the head of the entire set
+                            nextElement = this.setHeads[set_index];
+                        } else {
+                            // Last pointer goes back to the head of the next line
+                            nextElement = ((line_index + 1) << allSetOffset) + (shuffledArray[0] << 10) + (set_index << 4);
+                        }
+
+                        this.evictionArray[currentElement] = nextElement;
+                        currentElement = nextElement;
+                    } // line
+                } // set
+            };
+
+            this.createSetHeads(sets, ways);
+        } // PP object.
+
+
+        // Connect to the websockets server, wait until it connects
+        // source: https://stackoverflow.com/a/42306111
+        function createAndAwaitWebsocket(url) {
+            return new Promise(function (resolve, reject) {
+                websocket = new WebSocket(url);
+
+                // The socket server sends us the trace, save it in the result array.
+                websocket.onmessage = function (event) {
+                    resultArray = event.data;
+                    console.log('Trace returned: ' + resultArray);
+                }
+
+                websocket.onopen = function () {
+                    resolve(websocket);
+                };
+
+                websocket.onerror = function (err) {
+                    reject(err);
+                };
+
+            })
+        }
+
+
+        function createPPObject(sets, ways) {
+            PP = new PrimeProbe(sets, ways);
+        }
+
+        function createPPTextObject(sets, ways) {
+            PP = new PrimeProbeTxt(sets, ways);
+        }
+
+        function probeAllSets() {
+            var startTime = performance.now();
+            PP.probeAllSets();
+            return (performance.now() - startTime);
+        }
+
+
+        function performMeasurement() {
+            console.log("Starting measurement")
+
+            // Set up the result array
+            resultArray = new Array(MEASUREMENT_COUNT);
+            var nextMeasurementStartTime, currentTime;
+
+            // If we're using websockets, wait until the server opens, then send the first measurement to calibrate the deltas
+            if (USE_WEBSOCKETS == true) {
+                websocket.send(WEBSOCKET_PROBE_DATA);
+            } else {
+                // Otherwise use local timers.
+                nextMeasurementStartTime = performance.now() + SAMPLING_PERIOD_IN_MS;
+
+                // Spin until we're ready for the next measurement
+                do {
+                    currentTime = performance.now();
+                }
+                while (currentTime < nextMeasurementStartTime);
+            }
+
+            // For each measurement period
+            var measurement_index;
+            for (measurement_index = 0; measurement_index < MEASUREMENT_COUNT; measurement_index++) {
+
+                // If we use websockets just prime and send a message to the server
+                if (USE_WEBSOCKETS == true) {
+                    PP.probeAllSets();
+                    websocket.send(WEBSOCKET_PROBE_DATA);
+                } else {
+                    // Prepare for the next measurement
+                    nextMeasurementStartTime += SAMPLING_PERIOD_IN_MS;
+
+                    if (COUNT_SWEEPS == true) {
+                        var sweeps = 0;
+                        // repeatedly perform the measurement until the clock changes
+                        do {
+                            currentTime = performance.now();
+                            sweeps++;
+                            PP.probeAllSets();
+                        } while (currentTime < nextMeasurementStartTime);
+                    } else {
+                        // otherwise, perform the measurement
+                        PP.probeAllSets(SET_SKIPPING_STEP);
+                    }
+
+                    // Log the time it took
+                    if (COUNT_SWEEPS == true) {
+                        // log how many spins it took until the clock ticked again
+                        resultArray[measurement_index] = sweeps;
+                    } else {
+                        resultArray[measurement_index] = (performance.now() - currentTime).toFixed(3);
+                    }
+
+                    // Spin until the next measurement starts
+                    do {
+                        currentTime = performance.now();
+                    }
+                    while (currentTime < nextMeasurementStartTime);
+                } // if (use_websockets)
+            }
+
+            // If this is a WebSockets measurement, get the reading from the server
+            if (USE_WEBSOCKETS == false) {
+                console.log('Trace returned: ' + resultArray);
+            } else {
+                // The socket server will send us the trace
+                websocket.send('END');
+                console.log('Waiting for socket server to send us the trace');
+            }
+            console.log("Finished measurement")
+        }
+
+        function go() {
+            console.log("Starting...")
+
+            if (USE_ARRAYS == true) {
+                createPPObject(CACHE_SETS, CACHE_WAYS);
+            } else {
+                createPPTextObject(CACHE_SETS, CACHE_WAYS);
+            }
+
+            if (USE_WEBSOCKETS == true) {
+                createAndAwaitWebsocket(WEBSOCKET_URL).then(function (server) {
+                    setTimeout(function () { performMeasurement(); }, 0);
+                });
+            } else {
+                performMeasurement();
+            }
+
+        }
+
+        function arbitraryLengthText(inputText, requestedLength) {
+            var outputString = "";
+
+            // Repeatedly lengthen the string until it's longer than the text
+            while (outputString.length < requestedLength) {
+                outputString += inputText;
+            }
+
+            // Trim the string exactly to the requested length
+            return outputString.substring(0, requestedLength);
+        }
+
+        const SOURCE_TEXT = `
+        PREFACE TO 1850 EDITION
+
+I do not find it easy to get sufficiently far away from this Book, in the first sensations of having finished it, to refer to it with the composure which this formal heading would seem to require. My interest in it, is so recent and strong; and my mind is so divided between pleasure and regret—pleasure in the achievement of a long design, regret in the separation from many companions—that I am in danger of wearying the reader whom I love, with personal confidences, and private emotions.
+Besides which, all that I could say of the Story, to any purpose, I have endeavoured to say in it.
+It would concern the reader little, perhaps, to know, how sorrowfully the pen is laid down at the close of a two-years’ imaginative task; or how an Author feels as if he were dismissing some portion of himself into the shadowy world, when a crowd of the creatures of his brain are going from him for ever. Yet, I have nothing else to tell; unless, indeed, I were to confess (which might be of less moment still) that no one can ever believe this Narrative, in the reading, more than I have believed it in the writing.
+Instead of looking back, therefore, I will look forward. I cannot close this Volume more agreeably to myself, than with a hopeful glance towards the time when I shall again put forth my two green leaves once a month, and with a faithful remembrance of the genial sun and showers that have fallen on these leaves of David Copperfield, and made me happy.
+     London, October, 1850.
+
+
+
+
+PREFACE TO THE CHARLES DICKENS EDITION
+
+I REMARKED in the original Preface to this Book, that I did not find it easy to get sufficiently far away from it, in the first sensations of having finished it, to refer to it with the composure which this formal heading would seem to require. My interest in it was so recent and strong, and my mind was so divided between pleasure and regret—pleasure in the achievement of a long design, regret in the separation from many companions—that I was in danger of wearying the reader with personal confidences and private emotions.
+Besides which, all that I could have said of the Story to any purpose, I had endeavoured to say in it.
+It would concern the reader little, perhaps, to know how sorrowfully the pen is laid down at the close of a two-years’ imaginative task; or how an Author feels as if he were dismissing some portion of himself into the shadowy world, when a crowd of the creatures of his brain are going from him for ever. Yet, I had nothing else to tell; unless, indeed, I were to confess (which might be of less moment still), that no one can ever believe this Narrative, in the reading, more than I believed it in the writing.
+So true are these avowals at the present day, that I can now only take the reader into one confidence more. Of all my books, I like this the best. It will be easily believed that I am a fond parent to every child of my fancy, and that no one can ever love that family as dearly as I love them. But, like many fond parents, I have in my heart of hearts a favourite child. And his name is
+DAVID COPPERFIELD.
+     1869
+
+
+
+
+
+
+
+
+THE PERSONAL HISTORY AND EXPERIENCE OF DAVID COPPERFIELD THE YOUNGER
+
+
+
+
+
+CHAPTER 1. I AM BORN
+
+Whether I shall turn out to be the hero of my own life, or whether that station will be held by anybody else, these pages must show. To begin my life with the beginning of my life, I record that I was born (as I have been informed and believe) on a Friday, at twelve o’clock at night. It was remarked that the clock began to strike, and I began to cry, simultaneously.
+In consideration of the day and hour of my birth, it was declared by the nurse, and by some sage women in the neighbourhood who had taken a lively interest in me several months before there was any possibility of our becoming personally acquainted, first, that I was destined to be unlucky in life; and secondly, that I was privileged to see ghosts and spirits; both these gifts inevitably attaching, as they believed, to all unlucky infants of either gender, born towards the small hours on a Friday night.
+I need say nothing here, on the first head, because nothing can show better than my history whether that prediction was verified or falsified by the result. On the second branch of the question, I will only remark, that unless I ran through that part of my inheritance while I was still a baby, I have not come into it yet. But I do not at all complain of having been kept out of this property; and if anybody else should be in the present enjoyment of it, he is heartily welcome to keep it.
+I was born with a caul, which was advertised for sale, in the newspapers, at the low price of fifteen guineas. Whether sea-going people were short of money about that time, or were short of faith and preferred cork jackets, I don’t know; all I know is, that there was but one solitary bidding, and that was from an attorney connected with the bill-broking business, who offered two pounds in cash, and the balance in sherry, but declined to be guaranteed from drowning on any higher bargain. Consequently the advertisement was withdrawn at a dead loss—for as to sherry, my poor dear mother’s own sherry was in the market then—and ten years afterwards, the caul was put up in a raffle down in our part of the country, to fifty members at half-a-crown a head, the winner to spend five shillings. I was present myself, and I remember to have felt quite uncomfortable and confused, at a part of myself being disposed of in that way. The caul was won, I recollect, by an old lady with a hand-basket, who, very reluctantly, produced from it the stipulated five shillings, all in halfpence, and twopence halfpenny short—as it took an immense time and a great waste of arithmetic, to endeavour without any effect to prove to her. It is a fact which will be long remembered as remarkable down there, that she was never drowned, but died triumphantly in bed, at ninety-two. I have understood that it was, to the last, her proudest boast, that she never had been on the water in her life, except upon a bridge; and that over her tea (to which she was extremely partial) she, to the last, expressed her indignation at the impiety of mariners and others, who had the presumption to go ‘meandering’ about the world. It was in vain to represent to her that some conveniences, tea perhaps included, resulted from this objectionable practice. She always returned, with greater emphasis and with an instinctive knowledge of the strength of her objection, ‘Let us have no meandering.’
+Not to meander myself, at present, I will go back to my birth.
+I was born at Blunderstone, in Suffolk, or ‘there by’, as they say in Scotland. I was a posthumous child. My father’s eyes had closed upon the light of this world six months, when mine opened on it. There is something strange to me, even now, in the reflection that he never saw me; and something stranger yet in the shadowy remembrance that I have of my first childish associations with his white grave-stone in the churchyard, and of the indefinable compassion I used to feel for it lying out alone there in the dark night, when our little parlour was warm and bright with fire and candle, and the doors of our house were—almost cruelly, it seemed to me sometimes—bolted and locked against it.
+An aunt of my father’s, and consequently a great-aunt of mine, of whom I shall have more to relate by and by, was the principal magnate of our family. Miss Trotwood, or Miss Betsey, as my poor mother always called her, when she sufficiently overcame her dread of this formidable personage to mention her at all (which was seldom), had been married to a husband younger than herself, who was very handsome, except in the sense of the homely adage, ‘handsome is, that handsome does’—for he was strongly suspected of having beaten Miss Betsey, and even of having once, on a disputed question of supplies, made some hasty but determined arrangements to throw her out of a two pair of stairs’ window. These evidences of an incompatibility of temper induced Miss Betsey to pay him off, and effect a separation by mutual consent. He went to India with his capital, and there, according to a wild legend in our family, he was once seen riding on an elephant, in company with a Baboon; but I think it must have been a Baboo—or a Begum. Anyhow, from India tidings of his death reached home, within ten years. How they affected my aunt, nobody knew; for immediately upon the separation, she took her maiden name again, bought a cottage in a hamlet on the sea-coast a long way off, established herself there as a single woman with one servant, and was understood to live secluded, ever afterwards, in an inflexible retirement.
+My father had once been a favourite of hers, I believe; but she was mortally affronted by his marriage, on the ground that my mother was ‘a wax doll’. She had never seen my mother, but she knew her to be not yet twenty. My father and Miss Betsey never met again. He was double my mother’s age when he married, and of but a delicate constitution. He died a year afterwards, and, as I have said, six months before I came into the world.
+This was the state of matters, on the afternoon of, what I may be excused for calling, that eventful and important Friday. I can make no claim therefore to have known, at that time, how matters stood; or to have any remembrance, founded on the evidence of my own senses, of what follows.
+My mother was sitting by the fire, but poorly in health, and very low in spirits, looking at it through her tears, and desponding heavily about herself and the fatherless little stranger, who was already welcomed by some grosses of prophetic pins, in a drawer upstairs, to a world not at all excited on the subject of his arrival; my mother, I say, was sitting by the fire, that bright, windy March afternoon, very timid and sad, and very doubtful of ever coming alive out of the trial that was before her, when, lifting her eyes as she dried them, to the window opposite, she saw a strange lady coming up the garden.
+My mother had a sure foreboding at the second glance, that it was Miss Betsey. The setting sun was glowing on the strange lady, over the garden-fence, and she came walking up to the door with a fell rigidity of figure and composure of countenance that could have belonged to nobody else.
+When she reached the house, she gave another proof of her identity. My father had often hinted that she seldom conducted herself like any ordinary Christian; and now, instead of ringing the bell, she came and looked in at that identical window, pressing the end of her nose against the glass to that extent, that my poor dear mother used to say it became perfectly flat and white in a moment.
+She gave my mother such a turn, that I have always been convinced I am indebted to Miss Betsey for having been born on a Friday.
+My mother had left her chair in her agitation, and gone behind it in the corner. Miss Betsey, looking round the room, slowly and inquiringly, began on the other side, and carried her eyes on, like a Saracen’s Head in a Dutch clock, until they reached my mother. Then she made a frown and a gesture to my mother, like one who was accustomed to be obeyed, to come and open the door. My mother went.
+‘Mrs. David Copperfield, I think,’ said Miss Betsey; the emphasis referring, perhaps, to my mother’s mourning weeds, and her condition.
+‘Yes,’ said my mother, faintly.
+‘Miss Trotwood,’ said the visitor. ‘You have heard of her, I dare say?’
+My mother answered she had had that pleasure. And she had a disagreeable consciousness of not appearing to imply that it had been an overpowering pleasure.
+‘Now you see her,’ said Miss Betsey. My mother bent her head, and begged her to walk in.
+They went into the parlour my mother had come from, the fire in the best room on the other side of the passage not being lighted—not having been lighted, indeed, since my father’s funeral; and when they were both seated, and Miss Betsey said nothing, my mother, after vainly trying to restrain herself, began to cry. ‘Oh tut, tut, tut!’ said Miss Betsey, in a hurry. ‘Don’t do that! Come, come!’
+My mother couldn’t help it notwithstanding, so she cried until she had had her cry out.
+‘Take off your cap, child,’ said Miss Betsey, ‘and let me see you.’
+My mother was too much afraid of her to refuse compliance with this odd request, if she had any disposition to do so. Therefore she did as she was told, and did it with such nervous hands that her hair (which was luxuriant and beautiful) fell all about her face.
+‘Why, bless my heart!’ exclaimed Miss Betsey. ‘You are a very Baby!’
+My mother was, no doubt, unusually youthful in appearance even for her years; she hung her head, as if it were her fault, poor thing, and said, sobbing, that indeed she was afraid she was but a childish widow, and would be but a childish mother if she lived. In a short pause which ensued, she had a fancy that she felt Miss Betsey touch her hair, and that with no ungentle hand; but, looking at her, in her timid hope, she found that lady sitting with the skirt of her dress tucked up, her hands folded on one knee, and her feet upon the fender, frowning at the fire.
+‘In the name of Heaven,’ said Miss Betsey, suddenly, ‘why Rookery?’
+‘Do you mean the house, ma’am?’ asked my mother.
+‘Why Rookery?’ said Miss Betsey. ‘Cookery would have been more to the purpose, if you had had any practical ideas of life, either of you.’
+‘The name was Mr. Copperfield’s choice,’ returned my mother. ‘When he bought the house, he liked to think that there were rooks about it.’
+The evening wind made such a disturbance just now, among some tall old elm-trees at the bottom of the garden, that neither my mother nor Miss Betsey could forbear glancing that way. As the elms bent to one another, like giants who were whispering secrets, and after a few seconds of such repose, fell into a violent flurry, tossing their wild arms about, as if their late confidences were really too wicked for their peace of mind, some weatherbeaten ragged old rooks’-nests, burdening their higher branches, swung like wrecks upon a stormy sea.
+‘Where are the birds?’ asked Miss Betsey.
+‘The—?’ My mother had been thinking of something else.
+‘The rooks—what has become of them?’ asked Miss Betsey.
+‘There have not been any since we have lived here,’ said my mother. ‘We thought—Mr. Copperfield thought—it was quite a large rookery; but the nests were very old ones, and the birds have deserted them a long while.’
+‘David Copperfield all over!’ cried Miss Betsey. ‘David Copperfield from head to foot! Calls a house a rookery when there’s not a rook near it, and takes the birds on trust, because he sees the nests!’
+‘Mr. Copperfield,’ returned my mother, ‘is dead, and if you dare to speak unkindly of him to me—’
+My poor dear mother, I suppose, had some momentary intention of committing an assault and battery upon my aunt, who could easily have settled her with one hand, even if my mother had been in far better training for such an encounter than she was that evening. But it passed with the action of rising from her chair; and she sat down again very meekly, and fainted.
+When she came to herself, or when Miss Betsey had restored her, whichever it was, she found the latter standing at the window. The twilight was by this time shading down into darkness; and dimly as they saw each other, they could not have done that without the aid of the fire.
+‘Well?’ said Miss Betsey, coming back to her chair, as if she had only been taking a casual look at the prospect; ‘and when do you expect—’
+‘I am all in a tremble,’ faltered my mother. ‘I don’t know what’s the matter. I shall die, I am sure!’
+‘No, no, no,’ said Miss Betsey. ‘Have some tea.’
+‘Oh dear me, dear me, do you think it will do me any good?’ cried my mother in a helpless manner.
+‘Of course it will,’ said Miss Betsey. ‘It’s nothing but fancy. What do you call your girl?’
+‘I don’t know that it will be a girl, yet, ma’am,’ said my mother innocently.
+‘Bless the Baby!’ exclaimed Miss Betsey, unconsciously quoting the second sentiment of the pincushion in the drawer upstairs, but applying it to my mother instead of me, ‘I don’t mean that. I mean your servant-girl.’
+‘Peggotty,’ said my mother.
+‘Peggotty!’ repeated Miss Betsey, with some indignation. ‘Do you mean to say, child, that any human being has gone into a Christian church, and got herself named Peggotty?’ ‘It’s her surname,’ said my mother, faintly. ‘Mr. Copperfield called her by it, because her Christian name was the same as mine.’
+‘Here! Peggotty!’ cried Miss Betsey, opening the parlour door. ‘Tea. Your mistress is a little unwell. Don’t dawdle.’
+Having issued this mandate with as much potentiality as if she had been a recognized authority in the house ever since it had been a house, and having looked out to confront the amazed Peggotty coming along the passage with a candle at the sound of a strange voice, Miss Betsey shut the door again, and sat down as before: with her feet on the fender, the skirt of her dress tucked up, and her hands folded on one knee.
+‘You were speaking about its being a girl,’ said Miss Betsey. ‘I have no doubt it will be a girl. I have a presentiment that it must be a girl. Now child, from the moment of the birth of this girl—’
+‘Perhaps boy,’ my mother took the liberty of putting in.
+‘I tell you I have a presentiment that it must be a girl,’ returned Miss Betsey. ‘Don’t contradict. From the moment of this girl’s birth, child, I intend to be her friend. I intend to be her godmother, and I beg you’ll call her Betsey Trotwood Copperfield. There must be no mistakes in life with THIS Betsey Trotwood. There must be no trifling with HER affections, poor dear. She must be well brought up, and well guarded from reposing any foolish confidences where they are not deserved. I must make that MY care.’
+There was a twitch of Miss Betsey’s head, after each of these sentences, as if her own old wrongs were working within her, and she repressed any plainer reference to them by strong constraint. So my mother suspected, at least, as she observed her by the low glimmer of the fire: too much scared by Miss Betsey, too uneasy in herself, and too subdued and bewildered altogether, to observe anything very clearly, or to know what to say.
+‘And was David good to you, child?’ asked Miss Betsey, when she had been silent for a little while, and these motions of her head had gradually ceased. ‘Were you comfortable together?’
+‘We were very happy,’ said my mother. ‘Mr. Copperfield was only too good to me.’
+‘What, he spoilt you, I suppose?’ returned Miss Betsey.
+‘For being quite alone and dependent on myself in this rough world again, yes, I fear he did indeed,’ sobbed my mother.
+‘Well! Don’t cry!’ said Miss Betsey. ‘You were not equally matched, child—if any two people can be equally matched—and so I asked the question. You were an orphan, weren’t you?’ ‘Yes.’
+‘And a governess?’
+‘I was nursery-governess in a family where Mr. Copperfield came to visit. Mr. Copperfield was very kind to me, and took a great deal of notice of me, and paid me a good deal of attention, and at last proposed to me. And I accepted him. And so we were married,’ said my mother simply.
+‘Ha! Poor Baby!’ mused Miss Betsey, with her frown still bent upon the fire. ‘Do you know anything?’
+‘I beg your pardon, ma’am,’ faltered my mother.
+‘About keeping house, for instance,’ said Miss Betsey.
+‘Not much, I fear,’ returned my mother. ‘Not so much as I could wish. But Mr. Copperfield was teaching me—’
+(‘Much he knew about it himself!’) said Miss Betsey in a parenthesis. —‘And I hope I should have improved, being very anxious to learn, and he very patient to teach me, if the great misfortune of his death’—my mother broke down again here, and could get no farther.
+‘Well, well!’ said Miss Betsey. —‘I kept my housekeeping-book regularly, and balanced it with Mr. Copperfield every night,’ cried my mother in another burst of distress, and breaking down again.
+‘Well, well!’ said Miss Betsey. ‘Don’t cry any more.’ —‘And I am sure we never had a word of difference respecting it, except when Mr. Copperfield objected to my threes and fives being too much like each other, or to my putting curly tails to my sevens and nines,’ resumed my mother in another burst, and breaking down again.
+‘You’ll make yourself ill,’ said Miss Betsey, ‘and you know that will not be good either for you or for my god-daughter. Come! You mustn’t do it!’
+This argument had some share in quieting my mother, though her increasing indisposition had a larger one. There was an interval of silence, only broken by Miss Betsey’s occasionally ejaculating ‘Ha!’ as she sat with her feet upon the fender.
+‘David had bought an annuity for himself with his money, I know,’ said she, by and by. ‘What did he do for you?’
+‘Mr. Copperfield,’ said my mother, answering with some difficulty, ‘was so considerate and good as to secure the reversion of a part of it to me.’
+‘How much?’ asked Miss Betsey.
+‘A hundred and five pounds a year,’ said my mother.
+‘He might have done worse,’ said my aunt.
+The word was appropriate to the moment. My mother was so much worse that Peggotty, coming in with the teaboard and candles, and seeing at a glance how ill she was,—as Miss Betsey might have done sooner if there had been light enough,—conveyed her upstairs to her own room with all speed; and immediately dispatched Ham Peggotty, her nephew, who had been for some days past secreted in the house, unknown to my mother, as a special messenger in case of emergency, to fetch the nurse and doctor.
+Those allied powers were considerably astonished, when they arrived within a few minutes of each other, to find an unknown lady of portentous appearance, sitting before the fire, with her bonnet tied over her left arm, stopping her ears with jewellers’ cotton. Peggotty knowing nothing about her, and my mother saying nothing about her, she was quite a mystery in the parlour; and the fact of her having a magazine of jewellers’ cotton in her pocket, and sticking the article in her ears in that way, did not detract from the solemnity of her presence.
+The doctor having been upstairs and come down again, and having satisfied himself, I suppose, that there was a probability of this unknown lady and himself having to sit there, face to face, for some hours, laid himself out to be polite and social. He was the meekest of his sex, the mildest of little men. He sidled in and out of a room, to take up the less space. He walked as softly as the Ghost in Hamlet, and more slowly. He carried his head on one side, partly in modest depreciation of himself, partly in modest propitiation of everybody else. It is nothing to say that he hadn’t a word to throw at a dog. He couldn’t have thrown a word at a mad dog. He might have offered him one gently, or half a one, or a fragment of one; for he spoke as slowly as he walked; but he wouldn’t have been rude to him, and he couldn’t have been quick with him, for any earthly consideration.
+Mr. Chillip, looking mildly at my aunt with his head on one side, and making her a little bow, said, in allusion to the jewellers’ cotton, as he softly touched his left ear:
+‘Some local irritation, ma’am?’
+‘What!’ replied my aunt, pulling the cotton out of one ear like a cork.
+Mr. Chillip was so alarmed by her abruptness—as he told my mother afterwards—that it was a mercy he didn’t lose his presence of mind. But he repeated sweetly:
+‘Some local irritation, ma’am?’
+‘Nonsense!’ replied my aunt, and corked herself again, at one blow.
+Mr. Chillip could do nothing after this, but sit and look at her feebly, as she sat and looked at the fire, until he was called upstairs again. After some quarter of an hour’s absence, he returned.
+‘Well?’ said my aunt, taking the cotton out of the ear nearest to him.
+‘Well, ma’am,’ returned Mr. Chillip, ‘we are—we are progressing slowly, ma’am.’
+‘Ba—a—ah!’ said my aunt, with a perfect shake on the contemptuous interjection. And corked herself as before.
+Really—really—as Mr. Chillip told my mother, he was almost shocked; speaking in a professional point of view alone, he was almost shocked. But he sat and looked at her, notwithstanding, for nearly two hours, as she sat looking at the fire, until he was again called out. After another absence, he again returned.
+‘Well?’ said my aunt, taking out the cotton on that side again.
+‘Well, ma’am,’ returned Mr. Chillip, ‘we are—we are progressing slowly, ma’am.’
+‘Ya—a—ah!’ said my aunt. With such a snarl at him, that Mr. Chillip absolutely could not bear it. It was really calculated to break his spirit, he said afterwards. He preferred to go and sit upon the stairs, in the dark and a strong draught, until he was again sent for.
+Ham Peggotty, who went to the national school, and was a very dragon at his catechism, and who may therefore be regarded as a credible witness, reported next day, that happening to peep in at the parlour-door an hour after this, he was instantly descried by Miss Betsey, then walking to and fro in a state of agitation, and pounced upon before he could make his escape. That there were now occasional sounds of feet and voices overhead which he inferred the cotton did not exclude, from the circumstance of his evidently being clutched by the lady as a victim on whom to expend her superabundant agitation when the sounds were loudest. That, marching him constantly up and down by the collar (as if he had been taking too much laudanum), she, at those times, shook him, rumpled his hair, made light of his linen, stopped his ears as if she confounded them with her own, and otherwise tousled and maltreated him. This was in part confirmed by his aunt, who saw him at half past twelve o’clock, soon after his release, and affirmed that he was then as red as I was.
+The mild Mr. Chillip could not possibly bear malice at such a time, if at any time. He sidled into the parlour as soon as he was at liberty, and said to my aunt in his meekest manner:
+‘Well, ma’am, I am happy to congratulate you.’
+‘What upon?’ said my aunt, sharply.
+Mr. Chillip was fluttered again, by the extreme severity of my aunt’s manner; so he made her a little bow and gave her a little smile, to mollify her.
+‘Mercy on the man, what’s he doing!’ cried my aunt, impatiently. ‘Can’t he speak?’
+‘Be calm, my dear ma’am,’ said Mr. Chillip, in his softest accents.
+‘There is no longer any occasion for uneasiness, ma’am. Be calm.’
+It has since been considered almost a miracle that my aunt didn’t shake him, and shake what he had to say, out of him. She only shook her own head at him, but in a way that made him quail.
+‘Well, ma’am,’ resumed Mr. Chillip, as soon as he had courage, ‘I am happy to congratulate you. All is now over, ma’am, and well over.’
+During the five minutes or so that Mr. Chillip devoted to the delivery of this oration, my aunt eyed him narrowly.
+‘How is she?’ said my aunt, folding her arms with her bonnet still tied on one of them.
+‘Well, ma’am, she will soon be quite comfortable, I hope,’ returned Mr. Chillip. ‘Quite as comfortable as we can expect a young mother to be, under these melancholy domestic circumstances. There cannot be any objection to your seeing her presently, ma’am. It may do her good.’
+‘And SHE. How is SHE?’ said my aunt, sharply.
+Mr. Chillip laid his head a little more on one side, and looked at my aunt like an amiable bird.
+‘The baby,’ said my aunt. ‘How is she?’
+‘Ma’am,’ returned Mr. Chillip, ‘I apprehended you had known. It’s a boy.’
+My aunt said never a word, but took her bonnet by the strings, in the manner of a sling, aimed a blow at Mr. Chillip’s head with it, put it on bent, walked out, and never came back. She vanished like a discontented fairy; or like one of those supernatural beings, whom it was popularly supposed I was entitled to see; and never came back any more.
+No. I lay in my basket, and my mother lay in her bed; but Betsey Trotwood Copperfield was for ever in the land of dreams and shadows, the tremendous region whence I had so lately travelled; and the light upon the window of our room shone out upon the earthly bourne of all such travellers, and the mound above the ashes and the dust that once was he, without whom I had never been.
+
+
+
+
+CHAPTER 2. I OBSERVE
+
+The first objects that assume a distinct presence before me, as I look far back, into the blank of my infancy, are my mother with her pretty hair and youthful shape, and Peggotty with no shape at all, and eyes so dark that they seemed to darken their whole neighbourhood in her face, and cheeks and arms so hard and red that I wondered the birds didn’t peck her in preference to apples.
+I believe I can remember these two at a little distance apart, dwarfed to my sight by stooping down or kneeling on the floor, and I going unsteadily from the one to the other. I have an impression on my mind which I cannot distinguish from actual remembrance, of the touch of Peggotty’s forefinger as she used to hold it out to me, and of its being roughened by needlework, like a pocket nutmeg-grater.
+This may be fancy, though I think the memory of most of us can go farther back into such times than many of us suppose; just as I believe the power of observation in numbers of very young children to be quite wonderful for its closeness and accuracy. Indeed, I think that most grown men who are remarkable in this respect, may with greater propriety be said not to have lost the faculty, than to have acquired it; the rather, as I generally observe such men to retain a certain freshness, and gentleness, and capacity of being pleased, which are also an inheritance they have preserved from their childhood.
+I might have a misgiving that I am ‘meandering’ in stopping to say this, but that it brings me to remark that I build these conclusions, in part upon my own experience of myself; and if it should appear from anything I may set down in this narrative that I was a child of close observation, or that as a man I have a strong memory of my childhood, I undoubtedly lay claim to both of these characteristics.
+Looking back, as I was saying, into the blank of my infancy, the first objects I can remember as standing out by themselves from a confusion of things, are my mother and Peggotty. What else do I remember? Let me see.
+There comes out of the cloud, our house—not new to me, but quite familiar, in its earliest remembrance. On the ground-floor is Peggotty’s kitchen, opening into a back yard; with a pigeon-house on a pole, in the centre, without any pigeons in it; a great dog-kennel in a corner, without any dog; and a quantity of fowls that look terribly tall to me, walking about, in a menacing and ferocious manner. There is one cock who gets upon a post to crow, and seems to take particular notice of me as I look at him through the kitchen window, who makes me shiver, he is so fierce. Of the geese outside the side-gate who come waddling after me with their long necks stretched out when I go that way, I dream at night: as a man environed by wild beasts might dream of lions.
+Here is a long passage—what an enormous perspective I make of it!—leading from Peggotty’s kitchen to the front door. A dark store-room opens out of it, and that is a place to be run past at night; for I don’t know what may be among those tubs and jars and old tea-chests, when there is nobody in there with a dimly-burning light, letting a mouldy air come out of the door, in which there is the smell of soap, pickles, pepper, candles, and coffee, all at one whiff. Then there are the two parlours: the parlour in which we sit of an evening, my mother and I and Peggotty—for Peggotty is quite our companion, when her work is done and we are alone—and the best parlour where we sit on a Sunday; grandly, but not so comfortably. There is something of a doleful air about that room to me, for Peggotty has told me—I don’t know when, but apparently ages ago—about my father’s funeral, and the company having their black cloaks put on. One Sunday night my mother reads to Peggotty and me in there, how Lazarus was raised up from the dead. And I am so frightened that they are afterwards obliged to take me out of bed, and show me the quiet churchyard out of the bedroom window, with the dead all lying in their graves at rest, below the solemn moon.
+There is nothing half so green that I know anywhere, as the grass of that churchyard; nothing half so shady as its trees; nothing half so quiet as its tombstones. The sheep are feeding there, when I kneel up, early in the morning, in my little bed in a closet within my mother’s room, to look out at it; and I see the red light shining on the sun-dial, and think within myself, ‘Is the sun-dial glad, I wonder, that it can tell the time again?’
+0041 
+
+
+Here is our pew in the church. What a high-backed pew! With a window near it, out of which our house can be seen, and IS seen many times during the morning’s service, by Peggotty, who likes to make herself as sure as she can that it’s not being robbed, or is not in flames. But though Peggotty’s eye wanders, she is much offended if mine does, and frowns to me, as I stand upon the seat, that I am to look at the clergyman. But I can’t always look at him—I know him without that white thing on, and I am afraid of his wondering why I stare so, and perhaps stopping the service to inquire—and what am I to do? It’s a dreadful thing to gape, but I must do something. I look at my mother, but she pretends not to see me. I look at a boy in the aisle, and he makes faces at me. I look at the sunlight coming in at the open door through the porch, and there I see a stray sheep—I don’t mean a sinner, but mutton—half making up his mind to come into the church. I feel that if I looked at him any longer, I might be tempted to say something out loud; and what would become of me then! I look up at the monumental tablets on the wall, and try to think of Mr. Bodgers late of this parish, and what the feelings of Mrs. Bodgers must have been, when affliction sore, long time Mr. Bodgers bore, and physicians were in vain. I wonder whether they called in Mr. Chillip, and he was in vain; and if so, how he likes to be reminded of it once a week. I look from Mr. Chillip, in his Sunday neckcloth, to the pulpit; and think what a good place it would be to play in, and what a castle it would make, with another boy coming up the stairs to attack it, and having the velvet cushion with the tassels thrown down on his head. In time my eyes gradually shut up; and, from seeming to hear the clergyman singing a drowsy song in the heat, I hear nothing, until I fall off the seat with a crash, and am taken out, more dead than alive, by Peggotty.
+And now I see the outside of our house, with the latticed bedroom-windows standing open to let in the sweet-smelling air, and the ragged old rooks’-nests still dangling in the elm-trees at the bottom of the front garden. Now I am in the garden at the back, beyond the yard where the empty pigeon-house and dog-kennel are—a very preserve of butterflies, as I remember it, with a high fence, and a gate and padlock; where the fruit clusters on the trees, riper and richer than fruit has ever been since, in any other garden, and where my mother gathers some in a basket, while I stand by, bolting furtive gooseberries, and trying to look unmoved. A great wind rises, and the summer is gone in a moment. We are playing in the winter twilight, dancing about the parlour. When my mother is out of breath and rests herself in an elbow-chair, I watch her winding her bright curls round her fingers, and straitening her waist, and nobody knows better than I do that she likes to look so well, and is proud of being so pretty.
+That is among my very earliest impressions. That, and a sense that we were both a little afraid of Peggotty, and submitted ourselves in most things to her direction, were among the first opinions—if they may be so called—that I ever derived from what I saw.
+Peggotty and I were sitting one night by the parlour fire, alone. I had been reading to Peggotty about crocodiles. I must have read very perspicuously, or the poor soul must have been deeply interested, for I remember she had a cloudy impression, after I had done, that they were a sort of vegetable. I was tired of reading, and dead sleepy; but having leave, as a high treat, to sit up until my mother came home from spending the evening at a neighbour’s, I would rather have died upon my post (of course) than have gone to bed. I had reached that stage of sleepiness when Peggotty seemed to swell and grow immensely large. I propped my eyelids open with my two forefingers, and looked perseveringly at her as she sat at work; at the little bit of wax-candle she kept for her thread—how old it looked, being so wrinkled in all directions!—at the little house with a thatched roof, where the yard-measure lived; at her work-box with a sliding lid, with a view of St. Paul’s Cathedral (with a pink dome) painted on the top; at the brass thimble on her finger; at herself, whom I thought lovely. I felt so sleepy, that I knew if I lost sight of anything for a moment, I was gone.
+‘Peggotty,’ says I, suddenly, ‘were you ever married?’
+‘Lord, Master Davy,’ replied Peggotty. ‘What’s put marriage in your head?’
+She answered with such a start, that it quite awoke me. And then she stopped in her work, and looked at me, with her needle drawn out to its thread’s length.
+‘But WERE you ever married, Peggotty?’ says I. ‘You are a very handsome woman, an’t you?’
+I thought her in a different style from my mother, certainly; but of another school of beauty, I considered her a perfect example. There was a red velvet footstool in the best parlour, on which my mother had painted a nosegay. The ground-work of that stool, and Peggotty’s complexion appeared to me to be one and the same thing. The stool was smooth, and Peggotty was rough, but that made no difference.
+‘Me handsome, Davy!’ said Peggotty. ‘Lawk, no, my dear! But what put marriage in your head?’
+‘I don’t know!—You mustn’t marry more than one person at a time, may you, Peggotty?’
+‘Certainly not,’ says Peggotty, with the promptest decision.
+‘But if you marry a person, and the person dies, why then you may marry another person, mayn’t you, Peggotty?’
+‘YOU MAY,’ says Peggotty, ‘if you choose, my dear. That’s a matter of opinion.’
+‘But what is your opinion, Peggotty?’ said I.
+I asked her, and looked curiously at her, because she looked so curiously at me.
+‘My opinion is,’ said Peggotty, taking her eyes from me, after a little indecision and going on with her work, ‘that I never was married myself, Master Davy, and that I don’t expect to be. That’s all I know about the subject.’
+‘You an’t cross, I suppose, Peggotty, are you?’ said I, after sitting quiet for a minute.
+I really thought she was, she had been so short with me; but I was quite mistaken: for she laid aside her work (which was a stocking of her own), and opening her arms wide, took my curly head within them, and gave it a good squeeze. I know it was a good squeeze, because, being very plump, whenever she made any little exertion after she was dressed, some of the buttons on the back of her gown flew off. And I recollect two bursting to the opposite side of the parlour, while she was hugging me.
+‘Now let me hear some more about the Crorkindills,’ said Peggotty, who was not quite right in the name yet, ‘for I an’t heard half enough.’
+I couldn’t quite understand why Peggotty looked so queer, or why she was so ready to go back to the crocodiles. However, we returned to those monsters, with fresh wakefulness on my part, and we left their eggs in the sand for the sun to hatch; and we ran away from them, and baffled them by constantly turning, which they were unable to do quickly, on account of their unwieldy make; and we went into the water after them, as natives, and put sharp pieces of timber down their throats; and in short we ran the whole crocodile gauntlet. I did, at least; but I had my doubts of Peggotty, who was thoughtfully sticking her needle into various parts of her face and arms, all the time.
+We had exhausted the crocodiles, and begun with the alligators, when the garden-bell rang. We went out to the door; and there was my mother, looking unusually pretty, I thought, and with her a gentleman with beautiful black hair and whiskers, who had walked home with us from church last Sunday.
+As my mother stooped down on the threshold to take me in her arms and kiss me, the gentleman said I was a more highly privileged little fellow than a monarch—or something like that; for my later understanding comes, I am sensible, to my aid here.
+‘What does that mean?’ I asked him, over her shoulder.
+He patted me on the head; but somehow, I didn’t like him or his deep voice, and I was jealous that his hand should touch my mother’s in touching me—which it did. I put it away, as well as I could.
+‘Oh, Davy!’ remonstrated my mother.
+‘Dear boy!’ said the gentleman. ‘I cannot wonder at his devotion!’
+I never saw such a beautiful colour on my mother’s face before. She gently chid me for being rude; and, keeping me close to her shawl, turned to thank the gentleman for taking so much trouble as to bring her home. She put out her hand to him as she spoke, and, as he met it with his own, she glanced, I thought, at me.
+‘Let us say “good night”, my fine boy,’ said the gentleman, when he had bent his head—I saw him!—over my mother’s little glove.
+‘Good night!’ said I.
+‘Come! Let us be the best friends in the world!’ said the gentleman, laughing. ‘Shake hands!’
+My right hand was in my mother’s left, so I gave him the other.
+‘Why, that’s the Wrong hand, Davy!’ laughed the gentleman.
+My mother drew my right hand forward, but I was resolved, for my former reason, not to give it him, and I did not. I gave him the other, and he shook it heartily, and said I was a brave fellow, and went away.
+At this minute I see him turn round in the garden, and give us a last look with his ill-omened black eyes, before the door was shut.
+Peggotty, who had not said a word or moved a finger, secured the fastenings instantly, and we all went into the parlour. My mother, contrary to her usual habit, instead of coming to the elbow-chair by the fire, remained at the other end of the room, and sat singing to herself. —‘Hope you have had a pleasant evening, ma’am,’ said Peggotty, standing as stiff as a barrel in the centre of the room, with a candlestick in her hand.
+‘Much obliged to you, Peggotty,’ returned my mother, in a cheerful voice, ‘I have had a VERY pleasant evening.’
+‘A stranger or so makes an agreeable change,’ suggested Peggotty.
+‘A very agreeable change, indeed,’ returned my mother.
+Peggotty continuing to stand motionless in the middle of the room, and my mother resuming her singing, I fell asleep, though I was not so sound asleep but that I could hear voices, without hearing what they said. When I half awoke from this uncomfortable doze, I found Peggotty and my mother both in tears, and both talking.
+‘Not such a one as this, Mr. Copperfield wouldn’t have liked,’ said Peggotty. ‘That I say, and that I swear!’
+‘Good Heavens!’ cried my mother, ‘you’ll drive me mad! Was ever any poor girl so ill-used by her servants as I am! Why do I do myself the injustice of calling myself a girl? Have I never been married, Peggotty?’
+‘God knows you have, ma’am,’ returned Peggotty. ‘Then, how can you dare,’ said my mother—‘you know I don’t mean how can you dare, Peggotty, but how can you have the heart—to make me so uncomfortable and say such bitter things to me, when you are well aware that I haven’t, out of this place, a single friend to turn to?’
+‘The more’s the reason,’ returned Peggotty, ‘for saying that it won’t do. No! That it won’t do. No! No price could make it do. No!’—I thought Peggotty would have thrown the candlestick away, she was so emphatic with it.
+‘How can you be so aggravating,’ said my mother, shedding more tears than before, ‘as to talk in such an unjust manner! How can you go on as if it was all settled and arranged, Peggotty, when I tell you over and over again, you cruel thing, that beyond the commonest civilities nothing has passed! You talk of admiration. What am I to do? If people are so silly as to indulge the sentiment, is it my fault? What am I to do, I ask you? Would you wish me to shave my head and black my face, or disfigure myself with a burn, or a scald, or something of that sort? I dare say you would, Peggotty. I dare say you’d quite enjoy it.’
+Peggotty seemed to take this aspersion very much to heart, I thought.
+‘And my dear boy,’ cried my mother, coming to the elbow-chair in which I was, and caressing me, ‘my own little Davy! Is it to be hinted to me that I am wanting in affection for my precious treasure, the dearest little fellow that ever was!’
+‘Nobody never went and hinted no such a thing,’ said Peggotty.
+‘You did, Peggotty!’ returned my mother. ‘You know you did. What else was it possible to infer from what you said, you unkind creature, when you know as well as I do, that on his account only last quarter I wouldn’t buy myself a new parasol, though that old green one is frayed the whole way up, and the fringe is perfectly mangy? You know it is, Peggotty. You can’t deny it.’ Then, turning affectionately to me, with her cheek against mine, ‘Am I a naughty mama to you, Davy? Am I a nasty, cruel, selfish, bad mama? Say I am, my child; say “yes”, dear boy, and Peggotty will love you; and Peggotty’s love is a great deal better than mine, Davy. I don’t love you at all, do I?’
+At this, we all fell a-crying together. I think I was the loudest of the party, but I am sure we were all sincere about it. I was quite heart-broken myself, and am afraid that in the first transports of wounded tenderness I called Peggotty a ‘Beast’. That honest creature was in deep affliction, I remember, and must have become quite buttonless on the occasion; for a little volley of those explosives went off, when, after having made it up with my mother, she kneeled down by the elbow-chair, and made it up with me.
+We went to bed greatly dejected. My sobs kept waking me, for a long time; and when one very strong sob quite hoisted me up in bed, I found my mother sitting on the coverlet, and leaning over me. I fell asleep in her arms, after that, and slept soundly.
+Whether it was the following Sunday when I saw the gentleman again, or whether there was any greater lapse of time before he reappeared, I cannot recall. I don’t profess to be clear about dates. But there he was, in church, and he walked home with us afterwards. He came in, too, to look at a famous geranium we had, in the parlour-window. It did not appear to me that he took much notice of it, but before he went he asked my mother to give him a bit of the blossom. She begged him to choose it for himself, but he refused to do that—I could not understand why—so she plucked it for him, and gave it into his hand. He said he would never, never part with it any more; and I thought he must be quite a fool not to know that it would fall to pieces in a day or two.
+Peggotty began to be less with us, of an evening, than she had always been. My mother deferred to her very much—more than usual, it occurred to me—and we were all three excellent friends; still we were different from what we used to be, and were not so comfortable among ourselves. Sometimes I fancied that Peggotty perhaps objected to my mother’s wearing all the pretty dresses she had in her drawers, or to her going so often to visit at that neighbour’s; but I couldn’t, to my satisfaction, make out how it was.
+Gradually, I became used to seeing the gentleman with the black whiskers. I liked him no better than at first, and had the same uneasy jealousy of him; but if I had any reason for it beyond a child’s instinctive dislike, and a general idea that Peggotty and I could make much of my mother without any help, it certainly was not THE reason that I might have found if I had been older. No such thing came into my mind, or near it. I could observe, in little pieces, as it were; but as to making a net of a number of these pieces, and catching anybody in it, that was, as yet, beyond me.
+One autumn morning I was with my mother in the front garden, when Mr. Murdstone—I knew him by that name now—came by, on horseback. He reined up his horse to salute my mother, and said he was going to Lowestoft to see some friends who were there with a yacht, and merrily proposed to take me on the saddle before him if I would like the ride.
+The air was so clear and pleasant, and the horse seemed to like the idea of the ride so much himself, as he stood snorting and pawing at the garden-gate, that I had a great desire to go. So I was sent upstairs to Peggotty to be made spruce; and in the meantime Mr. Murdstone dismounted, and, with his horse’s bridle drawn over his arm, walked slowly up and down on the outer side of the sweetbriar fence, while my mother walked slowly up and down on the inner to keep him company. I recollect Peggotty and I peeping out at them from my little window; I recollect how closely they seemed to be examining the sweetbriar between them, as they strolled along; and how, from being in a perfectly angelic temper, Peggotty turned cross in a moment, and brushed my hair the wrong way, excessively hard.
+Mr. Murdstone and I were soon off, and trotting along on the green turf by the side of the road. He held me quite easily with one arm, and I don’t think I was restless usually; but I could not make up my mind to sit in front of him without turning my head sometimes, and looking up in his face. He had that kind of shallow black eye—I want a better word to express an eye that has no depth in it to be looked into—which, when it is abstracted, seems from some peculiarity of light to be disfigured, for a moment at a time, by a cast. Several times when I glanced at him, I observed that appearance with a sort of awe, and wondered what he was thinking about so closely. His hair and whiskers were blacker and thicker, looked at so near, than even I had given them credit for being. A squareness about the lower part of his face, and the dotted indication of the strong black beard he shaved close every day, reminded me of the wax-work that had travelled into our neighbourhood some half-a-year before. This, his regular eyebrows, and the rich white, and black, and brown, of his complexion—confound his complexion, and his memory!—made me think him, in spite of my misgivings, a very handsome man. I have no doubt that my poor dear mother thought him so too.
+We went to an hotel by the sea, where two gentlemen were smoking cigars in a room by themselves. Each of them was lying on at least four chairs, and had a large rough jacket on. In a corner was a heap of coats and boat-cloaks, and a flag, all bundled up together.
+They both rolled on to their feet in an untidy sort of manner, when we came in, and said, ‘Halloa, Murdstone! We thought you were dead!’
+‘Not yet,’ said Mr. Murdstone.
+‘And who’s this shaver?’ said one of the gentlemen, taking hold of me.
+‘That’s Davy,’ returned Mr. Murdstone.
+‘Davy who?’ said the gentleman. ‘Jones?’
+‘Copperfield,’ said Mr. Murdstone.
+‘What! Bewitching Mrs. Copperfield’s encumbrance?’ cried the gentleman. ‘The pretty little widow?’
+‘Quinion,’ said Mr. Murdstone, ‘take care, if you please. Somebody’s sharp.’
+‘Who is?’ asked the gentleman, laughing. I looked up, quickly; being curious to know.
+‘Only Brooks of Sheffield,’ said Mr. Murdstone.
+I was quite relieved to find that it was only Brooks of Sheffield; for, at first, I really thought it was I.
+There seemed to be something very comical in the reputation of Mr. Brooks of Sheffield, for both the gentlemen laughed heartily when he was mentioned, and Mr. Murdstone was a good deal amused also. After some laughing, the gentleman whom he had called Quinion, said:
+‘And what is the opinion of Brooks of Sheffield, in reference to the projected business?’
+‘Why, I don’t know that Brooks understands much about it at present,’ replied Mr. Murdstone; ‘but he is not generally favourable, I believe.’
+There was more laughter at this, and Mr. Quinion said he would ring the bell for some sherry in which to drink to Brooks. This he did; and when the wine came, he made me have a little, with a biscuit, and, before I drank it, stand up and say, ‘Confusion to Brooks of Sheffield!’ The toast was received with great applause, and such hearty laughter that it made me laugh too; at which they laughed the more. In short, we quite enjoyed ourselves.
+We walked about on the cliff after that, and sat on the grass, and looked at things through a telescope—I could make out nothing myself when it was put to my eye, but I pretended I could—and then we came back to the hotel to an early dinner. All the time we were out, the two gentlemen smoked incessantly—which, I thought, if I might judge from the smell of their rough coats, they must have been doing, ever since the coats had first come home from the tailor’s. I must not forget that we went on board the yacht, where they all three descended into the cabin, and were busy with some papers. I saw them quite hard at work, when I looked down through the open skylight. They left me, during this time, with a very nice man with a very large head of red hair and a very small shiny hat upon it, who had got a cross-barred shirt or waistcoat on, with ‘Skylark’ in capital letters across the chest. I thought it was his name; and that as he lived on board ship and hadn’t a street door to put his name on, he put it there instead; but when I called him Mr. Skylark, he said it meant the vessel.
+I observed all day that Mr. Murdstone was graver and steadier than the two gentlemen. They were very gay and careless. They joked freely with one another, but seldom with him. It appeared to me that he was more clever and cold than they were, and that they regarded him with something of my own feeling. I remarked that, once or twice when Mr. Quinion was talking, he looked at Mr. Murdstone sideways, as if to make sure of his not being displeased; and that once when Mr. Passnidge (the other gentleman) was in high spirits, he trod upon his foot, and gave him a secret caution with his eyes, to observe Mr. Murdstone, who was sitting stern and silent. Nor do I recollect that Mr. Murdstone laughed at all that day, except at the Sheffield joke—and that, by the by, was his own.
+We went home early in the evening. It was a very fine evening, and my mother and he had another stroll by the sweetbriar, while I was sent in to get my tea. When he was gone, my mother asked me all about the day I had had, and what they had said and done. I mentioned what they had said about her, and she laughed, and told me they were impudent fellows who talked nonsense—but I knew it pleased her. I knew it quite as well as I know it now. I took the opportunity of asking if she was at all acquainted with Mr. Brooks of Sheffield, but she answered No, only she supposed he must be a manufacturer in the knife and fork way.
+Can I say of her face—altered as I have reason to remember it, perished as I know it is—that it is gone, when here it comes before me at this instant, as distinct as any face that I may choose to look on in a crowded street? Can I say of her innocent and girlish beauty, that it faded, and was no more, when its breath falls on my cheek now, as it fell that night? Can I say she ever changed, when my remembrance brings her back to life, thus only; and, truer to its loving youth than I have been, or man ever is, still holds fast what it cherished then?
+I write of her just as she was when I had gone to bed after this talk, and she came to bid me good night. She kneeled down playfully by the side of the bed, and laying her chin upon her hands, and laughing, said:
+‘What was it they said, Davy? Tell me again. I can’t believe it.’
+‘“Bewitching—“’ I began.
+My mother put her hands upon my lips to stop me.
+‘It was never bewitching,’ she said, laughing. ‘It never could have been bewitching, Davy. Now I know it wasn’t!’
+‘Yes, it was. “Bewitching Mrs. Copperfield”,’ I repeated stoutly. ‘And, “pretty.”’
+‘No, no, it was never pretty. Not pretty,’ interposed my mother, laying her fingers on my lips again.
+‘Yes it was. “Pretty little widow.”’
+‘What foolish, impudent creatures!’ cried my mother, laughing and covering her face. ‘What ridiculous men! An’t they? Davy dear—’
+‘Well, Ma.’
+‘Don’t tell Peggotty; she might be angry with them. I am dreadfully angry with them myself; but I would rather Peggotty didn’t know.’
+I promised, of course; and we kissed one another over and over again, and I soon fell fast asleep.
+It seems to me, at this distance of time, as if it were the next day when Peggotty broached the striking and adventurous proposition I am about to mention; but it was probably about two months afterwards.
+We were sitting as before, one evening (when my mother was out as before), in company with the stocking and the yard-measure, and the bit of wax, and the box with St. Paul’s on the lid, and the crocodile book, when Peggotty, after looking at me several times, and opening her mouth as if she were going to speak, without doing it—which I thought was merely gaping, or I should have been rather alarmed—said coaxingly:
+‘Master Davy, how should you like to go along with me and spend a fortnight at my brother’s at Yarmouth? Wouldn’t that be a treat?’
+‘Is your brother an agreeable man, Peggotty?’ I inquired, provisionally.
+‘Oh, what an agreeable man he is!’ cried Peggotty, holding up her hands. ‘Then there’s the sea; and the boats and ships; and the fishermen; and the beach; and Am to play with—’
+Peggotty meant her nephew Ham, mentioned in my first chapter; but she spoke of him as a morsel of English Grammar.
+I was flushed by her summary of delights, and replied that it would indeed be a treat, but what would my mother say?
+‘Why then I’ll as good as bet a guinea,’ said Peggotty, intent upon my face, ‘that she’ll let us go. I’ll ask her, if you like, as soon as ever she comes home. There now!’
+‘But what’s she to do while we’re away?’ said I, putting my small elbows on the table to argue the point. ‘She can’t live by herself.’
+If Peggotty were looking for a hole, all of a sudden, in the heel of that stocking, it must have been a very little one indeed, and not worth darning.
+‘I say! Peggotty! She can’t live by herself, you know.’
+‘Oh, bless you!’ said Peggotty, looking at me again at last. ‘Don’t you know? She’s going to stay for a fortnight with Mrs. Grayper. Mrs. Grayper’s going to have a lot of company.’
+Oh! If that was it, I was quite ready to go. I waited, in the utmost impatience, until my mother came home from Mrs. Grayper’s (for it was that identical neighbour), to ascertain if we could get leave to carry out this great idea. Without being nearly so much surprised as I had expected, my mother entered into it readily; and it was all arranged that night, and my board and lodging during the visit were to be paid for.
+The day soon came for our going. It was such an early day that it came soon, even to me, who was in a fever of expectation, and half afraid that an earthquake or a fiery mountain, or some other great convulsion of nature, might interpose to stop the expedition. We were to go in a carrier’s cart, which departed in the morning after breakfast. I would have given any money to have been allowed to wrap myself up over-night, and sleep in my hat and boots.
+It touches me nearly now, although I tell it lightly, to recollect how eager I was to leave my happy home; to think how little I suspected what I did leave for ever.
+I am glad to recollect that when the carrier’s cart was at the gate, and my mother stood there kissing me, a grateful fondness for her and for the old place I had never turned my back upon before, made me cry. I am glad to know that my mother cried too, and that I felt her heart beat against mine.
+I am glad to recollect that when the carrier began to move, my mother ran out at the gate, and called to him to stop, that she might kiss me once more. I am glad to dwell upon the earnestness and love with which she lifted up her face to mine, and did so.
+As we left her standing in the road, Mr. Murdstone came up to where she was, and seemed to expostulate with her for being so moved. I was looking back round the awning of the cart, and wondered what business it was of his. Peggotty, who was also looking back on the other side, seemed anything but satisfied; as the face she brought back in the cart denoted.
+I sat looking at Peggotty for some time, in a reverie on this supposititious case: whether, if she were employed to lose me like the boy in the fairy tale, I should be able to track my way home again by the buttons she would shed.
+
+
+
+
+CHAPTER 3. I HAVE A CHANGE
+
+The carrier’s horse was the laziest horse in the world, I should hope, and shuffled along, with his head down, as if he liked to keep people waiting to whom the packages were directed. I fancied, indeed, that he sometimes chuckled audibly over this reflection, but the carrier said he was only troubled with a cough. The carrier had a way of keeping his head down, like his horse, and of drooping sleepily forward as he drove, with one of his arms on each of his knees. I say ‘drove’, but it struck me that the cart would have gone to Yarmouth quite as well without him, for the horse did all that; and as to conversation, he had no idea of it but whistling.
+Peggotty had a basket of refreshments on her knee, which would have lasted us out handsomely, if we had been going to London by the same conveyance. We ate a good deal, and slept a good deal. Peggotty always went to sleep with her chin upon the handle of the basket, her hold of which never relaxed; and I could not have believed unless I had heard her do it, that one defenceless woman could have snored so much.
+We made so many deviations up and down lanes, and were such a long time delivering a bedstead at a public-house, and calling at other places, that I was quite tired, and very glad, when we saw Yarmouth. It looked rather spongy and soppy, I thought, as I carried my eye over the great dull waste that lay across the river; and I could not help wondering, if the world were really as round as my geography book said, how any part of it came to be so flat. But I reflected that Yarmouth might be situated at one of the poles; which would account for it.
+As we drew a little nearer, and saw the whole adjacent prospect lying a straight low line under the sky, I hinted to Peggotty that a mound or so might have improved it; and also that if the land had been a little more separated from the sea, and the town and the tide had not been quite so much mixed up, like toast and water, it would have been nicer. But Peggotty said, with greater emphasis than usual, that we must take things as we found them, and that, for her part, she was proud to call herself a Yarmouth Bloater.
+When we got into the street (which was strange enough to me) and smelt the fish, and pitch, and oakum, and tar, and saw the sailors walking about, and the carts jingling up and down over the stones, I felt that I had done so busy a place an injustice; and said as much to Peggotty, who heard my expressions of delight with great complacency, and told me it was well known (I suppose to those who had the good fortune to be born Bloaters) that Yarmouth was, upon the whole, the finest place in the universe.
+‘Here’s my Am!’ screamed Peggotty, ‘growed out of knowledge!’
+He was waiting for us, in fact, at the public-house; and asked me how I found myself, like an old acquaintance. I did not feel, at first, that I knew him as well as he knew me, because he had never come to our house since the night I was born, and naturally he had the advantage of me. But our intimacy was much advanced by his taking me on his back to carry me home. He was, now, a huge, strong fellow of six feet high, broad in proportion, and round-shouldered; but with a simpering boy’s face and curly light hair that gave him quite a sheepish look. He was dressed in a canvas jacket, and a pair of such very stiff trousers that they would have stood quite as well alone, without any legs in them. And you couldn’t so properly have said he wore a hat, as that he was covered in a-top, like an old building, with something pitchy.
+Ham carrying me on his back and a small box of ours under his arm, and Peggotty carrying another small box of ours, we turned down lanes bestrewn with bits of chips and little hillocks of sand, and went past gas-works, rope-walks, boat-builders’ yards, shipwrights’ yards, ship-breakers’ yards, caulkers’ yards, riggers’ lofts, smiths’ forges, and a great litter of such places, until we came out upon the dull waste I had already seen at a distance; when Ham said,
+‘Yon’s our house, Mas’r Davy!’
+I looked in all directions, as far as I could stare over the wilderness, and away at the sea, and away at the river, but no house could I make out. There was a black barge, or some other kind of superannuated boat, not far off, high and dry on the ground, with an iron funnel sticking out of it for a chimney and smoking very cosily; but nothing else in the way of a habitation that was visible to me.
+‘That’s not it?’ said I. ‘That ship-looking thing?’
+‘That’s it, Mas’r Davy,’ returned Ham.
+If it had been Aladdin’s palace, roc’s egg and all, I suppose I could not have been more charmed with the romantic idea of living in it. There was a delightful door cut in the side, and it was roofed in, and there were little windows in it; but the wonderful charm of it was, that it was a real boat which had no doubt been upon the water hundreds of times, and which had never been intended to be lived in, on dry land. That was the captivation of it to me. If it had ever been meant to be lived in, I might have thought it small, or inconvenient, or lonely; but never having been designed for any such use, it became a perfect abode.
+It was beautifully clean inside, and as tidy as possible. There was a table, and a Dutch clock, and a chest of drawers, and on the chest of drawers there was a tea-tray with a painting on it of a lady with a parasol, taking a walk with a military-looking child who was trundling a hoop. The tray was kept from tumbling down, by a bible; and the tray, if it had tumbled down, would have smashed a quantity of cups and saucers and a teapot that were grouped around the book. On the walls there were some common coloured pictures, framed and glazed, of scripture subjects; such as I have never seen since in the hands of pedlars, without seeing the whole interior of Peggotty’s brother’s house again, at one view. Abraham in red going to sacrifice Isaac in blue, and Daniel in yellow cast into a den of green lions, were the most prominent of these. Over the little mantelshelf, was a picture of the ‘Sarah Jane’ lugger, built at Sunderland, with a real little wooden stern stuck on to it; a work of art, combining composition with carpentry, which I considered to be one of the most enviable possessions that the world could afford. There were some hooks in the beams of the ceiling, the use of which I did not divine then; and some lockers and boxes and conveniences of that sort, which served for seats and eked out the chairs.
+All this I saw in the first glance after I crossed the threshold—child-like, according to my theory—and then Peggotty opened a little door and showed me my bedroom. It was the completest and most desirable bedroom ever seen—in the stern of the vessel; with a little window, where the rudder used to go through; a little looking-glass, just the right height for me, nailed against the wall, and framed with oyster-shells; a little bed, which there was just room enough to get into; and a nosegay of seaweed in a blue mug on the table. The walls were whitewashed as white as milk, and the patchwork counterpane made my eyes quite ache with its brightness. One thing I particularly noticed in this delightful house, was the smell of fish; which was so searching, that when I took out my pocket-handkerchief to wipe my nose, I found it smelt exactly as if it had wrapped up a lobster. On my imparting this discovery in confidence to Peggotty, she informed me that her brother dealt in lobsters, crabs, and crawfish; and I afterwards found that a heap of these creatures, in a state of wonderful conglomeration with one another, and never leaving off pinching whatever they laid hold of, were usually to be found in a little wooden outhouse where the pots and kettles were kept.
+We were welcomed by a very civil woman in a white apron, whom I had seen curtseying at the door when I was on Ham’s back, about a quarter of a mile off. Likewise by a most beautiful little girl (or I thought her so) with a necklace of blue beads on, who wouldn’t let me kiss her when I offered to, but ran away and hid herself. By and by, when we had dined in a sumptuous manner off boiled dabs, melted butter, and potatoes, with a chop for me, a hairy man with a very good-natured face came home. As he called Peggotty ‘Lass’, and gave her a hearty smack on the cheek, I had no doubt, from the general propriety of her conduct, that he was her brother; and so he turned out—being presently introduced to me as Mr. Peggotty, the master of the house.
+‘Glad to see you, sir,’ said Mr. Peggotty. ‘You’ll find us rough, sir, but you’ll find us ready.’
+0061 
+
+
+I thanked him, and replied that I was sure I should be happy in such a delightful place.
+‘How’s your Ma, sir?’ said Mr. Peggotty. ‘Did you leave her pretty jolly?’
+I gave Mr. Peggotty to understand that she was as jolly as I could wish, and that she desired her compliments—which was a polite fiction on my part.
+‘I’m much obleeged to her, I’m sure,’ said Mr. Peggotty. ‘Well, sir, if you can make out here, fur a fortnut, ‘long wi’ her,’ nodding at his sister, ‘and Ham, and little Em’ly, we shall be proud of your company.’
+Having done the honours of his house in this hospitable manner, Mr. Peggotty went out to wash himself in a kettleful of hot water, remarking that ‘cold would never get his muck off’. He soon returned, greatly improved in appearance; but so rubicund, that I couldn’t help thinking his face had this in common with the lobsters, crabs, and crawfish,—that it went into the hot water very black, and came out very red.
+After tea, when the door was shut and all was made snug (the nights being cold and misty now), it seemed to me the most delicious retreat that the imagination of man could conceive. To hear the wind getting up out at sea, to know that the fog was creeping over the desolate flat outside, and to look at the fire, and think that there was no house near but this one, and this one a boat, was like enchantment. Little Em’ly had overcome her shyness, and was sitting by my side upon the lowest and least of the lockers, which was just large enough for us two, and just fitted into the chimney corner. Mrs. Peggotty with the white apron, was knitting on the opposite side of the fire. Peggotty at her needlework was as much at home with St. Paul’s and the bit of wax-candle, as if they had never known any other roof. Ham, who had been giving me my first lesson in all-fours, was trying to recollect a scheme of telling fortunes with the dirty cards, and was printing off fishy impressions of his thumb on all the cards he turned. Mr. Peggotty was smoking his pipe. I felt it was a time for conversation and confidence.
+‘Mr. Peggotty!’ says I.
+‘Sir,’ says he.
+‘Did you give your son the name of Ham, because you lived in a sort of ark?’
+Mr. Peggotty seemed to think it a deep idea, but answered:
+‘No, sir. I never giv him no name.’
+‘Who gave him that name, then?’ said I, putting question number two of the catechism to Mr. Peggotty.
+‘Why, sir, his father giv it him,’ said Mr. Peggotty.
+‘I thought you were his father!’
+‘My brother Joe was his father,’ said Mr. Peggotty.
+‘Dead, Mr. Peggotty?’ I hinted, after a respectful pause.
+‘Drowndead,’ said Mr. Peggotty.
+I was very much surprised that Mr. Peggotty was not Ham’s father, and began to wonder whether I was mistaken about his relationship to anybody else there. I was so curious to know, that I made up my mind to have it out with Mr. Peggotty.
+‘Little Em’ly,’ I said, glancing at her. ‘She is your daughter, isn’t she, Mr. Peggotty?’
+‘No, sir. My brother-in-law, Tom, was her father.’
+I couldn’t help it. ‘—Dead, Mr. Peggotty?’ I hinted, after another respectful silence.
+‘Drowndead,’ said Mr. Peggotty.
+I felt the difficulty of resuming the subject, but had not got to the bottom of it yet, and must get to the bottom somehow. So I said:
+‘Haven’t you ANY children, Mr. Peggotty?’
+‘No, master,’ he answered with a short laugh. ‘I’m a bacheldore.’
+‘A bachelor!’ I said, astonished. ‘Why, who’s that, Mr. Peggotty?’ pointing to the person in the apron who was knitting.
+‘That’s Missis Gummidge,’ said Mr. Peggotty.
+‘Gummidge, Mr. Peggotty?’
+But at this point Peggotty—I mean my own peculiar Peggotty—made such impressive motions to me not to ask any more questions, that I could only sit and look at all the silent company, until it was time to go to bed. Then, in the privacy of my own little cabin, she informed me that Ham and Em’ly were an orphan nephew and niece, whom my host had at different times adopted in their childhood, when they were left destitute: and that Mrs. Gummidge was the widow of his partner in a boat, who had died very poor. He was but a poor man himself, said Peggotty, but as good as gold and as true as steel—those were her similes. The only subject, she informed me, on which he ever showed a violent temper or swore an oath, was this generosity of his; and if it were ever referred to, by any one of them, he struck the table a heavy blow with his right hand (had split it on one such occasion), and swore a dreadful oath that he would be ‘Gormed’ if he didn’t cut and run for good, if it was ever mentioned again. It appeared, in answer to my inquiries, that nobody had the least idea of the etymology of this terrible verb passive to be gormed; but that they all regarded it as constituting a most solemn imprecation.
+I was very sensible of my entertainer’s goodness, and listened to the women’s going to bed in another little crib like mine at the opposite end of the boat, and to him and Ham hanging up two hammocks for themselves on the hooks I had noticed in the roof, in a very luxurious state of mind, enhanced by my being sleepy. As slumber gradually stole upon me, I heard the wind howling out at sea and coming on across the flat so fiercely, that I had a lazy apprehension of the great deep rising in the night. But I bethought myself that I was in a boat, after all; and that a man like Mr. Peggotty was not a bad person to have on board if anything did happen.
+Nothing happened, however, worse than morning. Almost as soon as it shone upon the oyster-shell frame of my mirror I was out of bed, and out with little Em’ly, picking up stones upon the beach.
+‘You’re quite a sailor, I suppose?’ I said to Em’ly. I don’t know that I supposed anything of the kind, but I felt it an act of gallantry to say something; and a shining sail close to us made such a pretty little image of itself, at the moment, in her bright eye, that it came into my head to say this.
+‘No,’ replied Em’ly, shaking her head, ‘I’m afraid of the sea.’
+‘Afraid!’ I said, with a becoming air of boldness, and looking very big at the mighty ocean. ‘I an’t!’
+‘Ah! but it’s cruel,’ said Em’ly. ‘I have seen it very cruel to some of our men. I have seen it tear a boat as big as our house, all to pieces.’
+‘I hope it wasn’t the boat that—’
+‘That father was drownded in?’ said Em’ly. ‘No. Not that one, I never see that boat.’
+‘Nor him?’ I asked her.
+Little Em’ly shook her head. ‘Not to remember!’
+Here was a coincidence! I immediately went into an explanation how I had never seen my own father; and how my mother and I had always lived by ourselves in the happiest state imaginable, and lived so then, and always meant to live so; and how my father’s grave was in the churchyard near our house, and shaded by a tree, beneath the boughs of which I had walked and heard the birds sing many a pleasant morning. But there were some differences between Em’ly’s orphanhood and mine, it appeared. She had lost her mother before her father; and where her father’s grave was no one knew, except that it was somewhere in the depths of the sea.
+‘Besides,’ said Em’ly, as she looked about for shells and pebbles, ‘your father was a gentleman and your mother is a lady; and my father was a fisherman and my mother was a fisherman’s daughter, and my uncle Dan is a fisherman.’
+‘Dan is Mr. Peggotty, is he?’ said I.
+‘Uncle Dan—yonder,’ answered Em’ly, nodding at the boat-house.
+‘Yes. I mean him. He must be very good, I should think?’
+‘Good?’ said Em’ly. ‘If I was ever to be a lady, I’d give him a sky-blue coat with diamond buttons, nankeen trousers, a red velvet waistcoat, a cocked hat, a large gold watch, a silver pipe, and a box of money.’
+I said I had no doubt that Mr. Peggotty well deserved these treasures. I must acknowledge that I felt it difficult to picture him quite at his ease in the raiment proposed for him by his grateful little niece, and that I was particularly doubtful of the policy of the cocked hat; but I kept these sentiments to myself.
+Little Em’ly had stopped and looked up at the sky in her enumeration of these articles, as if they were a glorious vision. We went on again, picking up shells and pebbles.
+‘You would like to be a lady?’ I said.
+Emily looked at me, and laughed and nodded ‘yes’.
+‘I should like it very much. We would all be gentlefolks together, then. Me, and uncle, and Ham, and Mrs. Gummidge. We wouldn’t mind then, when there comes stormy weather.—-Not for our own sakes, I mean. We would for the poor fishermen’s, to be sure, and we’d help ‘em with money when they come to any hurt.’ This seemed to me to be a very satisfactory and therefore not at all improbable picture. I expressed my pleasure in the contemplation of it, and little Em’ly was emboldened to say, shyly,
+‘Don’t you think you are afraid of the sea, now?’
+It was quiet enough to reassure me, but I have no doubt if I had seen a moderately large wave come tumbling in, I should have taken to my heels, with an awful recollection of her drowned relations. However, I said ‘No,’ and I added, ‘You don’t seem to be either, though you say you are,’—for she was walking much too near the brink of a sort of old jetty or wooden causeway we had strolled upon, and I was afraid of her falling over.
+‘I’m not afraid in this way,’ said little Em’ly. ‘But I wake when it blows, and tremble to think of Uncle Dan and Ham and believe I hear ‘em crying out for help. That’s why I should like so much to be a lady. But I’m not afraid in this way. Not a bit. Look here!’
+She started from my side, and ran along a jagged timber which protruded from the place we stood upon, and overhung the deep water at some height, without the least defence. The incident is so impressed on my remembrance, that if I were a draughtsman I could draw its form here, I dare say, accurately as it was that day, and little Em’ly springing forward to her destruction (as it appeared to me), with a look that I have never forgotten, directed far out to sea.
+The light, bold, fluttering little figure turned and came back safe to me, and I soon laughed at my fears, and at the cry I had uttered; fruitlessly in any case, for there was no one near. But there have been times since, in my manhood, many times there have been, when I have thought, Is it possible, among the possibilities of hidden things, that in the sudden rashness of the child and her wild look so far off, there was any merciful attraction of her into danger, any tempting her towards him permitted on the part of her dead father, that her life might have a chance of ending that day? There has been a time since when I have wondered whether, if the life before her could have been revealed to me at a glance, and so revealed as that a child could fully comprehend it, and if her preservation could have depended on a motion of my hand, I ought to have held it up to save her. There has been a time since—I do not say it lasted long, but it has been—when I have asked myself the question, would it have been better for little Em’ly to have had the waters close above her head that morning in my sight; and when I have answered Yes, it would have been.
+This may be premature. I have set it down too soon, perhaps. But let it stand.
+We strolled a long way, and loaded ourselves with things that we thought curious, and put some stranded starfish carefully back into the water—I hardly know enough of the race at this moment to be quite certain whether they had reason to feel obliged to us for doing so, or the reverse—and then made our way home to Mr. Peggotty’s dwelling. We stopped under the lee of the lobster-outhouse to exchange an innocent kiss, and went in to breakfast glowing with health and pleasure.
+‘Like two young mavishes,’ Mr. Peggotty said. I knew this meant, in our local dialect, like two young thrushes, and received it as a compliment.
+Of course I was in love with little Em’ly. I am sure I loved that baby quite as truly, quite as tenderly, with greater purity and more disinterestedness, than can enter into the best love of a later time of life, high and ennobling as it is. I am sure my fancy raised up something round that blue-eyed mite of a child, which etherealized, and made a very angel of her. If, any sunny forenoon, she had spread a little pair of wings and flown away before my eyes, I don’t think I should have regarded it as much more than I had had reason to expect.
+We used to walk about that dim old flat at Yarmouth in a loving manner, hours and hours. The days sported by us, as if Time had not grown up himself yet, but were a child too, and always at play. I told Em’ly I adored her, and that unless she confessed she adored me I should be reduced to the necessity of killing myself with a sword. She said she did, and I have no doubt she did.
+As to any sense of inequality, or youthfulness, or other difficulty in our way, little Em’ly and I had no such trouble, because we had no future. We made no more provision for growing older, than we did for growing younger. We were the admiration of Mrs. Gummidge and Peggotty, who used to whisper of an evening when we sat, lovingly, on our little locker side by side, ‘Lor! wasn’t it beautiful!’ Mr. Peggotty smiled at us from behind his pipe, and Ham grinned all the evening and did nothing else. They had something of the sort of pleasure in us, I suppose, that they might have had in a pretty toy, or a pocket model of the Colosseum.
+I soon found out that Mrs. Gummidge did not always make herself so agreeable as she might have been expected to do, under the circumstances of her residence with Mr. Peggotty. Mrs. Gummidge’s was rather a fretful disposition, and she whimpered more sometimes than was comfortable for other parties in so small an establishment. I was very sorry for her; but there were moments when it would have been more agreeable, I thought, if Mrs. Gummidge had had a convenient apartment of her own to retire to, and had stopped there until her spirits revived.
+Mr. Peggotty went occasionally to a public-house called The Willing Mind. I discovered this, by his being out on the second or third evening of our visit, and by Mrs. Gummidge’s looking up at the Dutch clock, between eight and nine, and saying he was there, and that, what was more, she had known in the morning he would go there.
+Mrs. Gummidge had been in a low state all day, and had burst into tears in the forenoon, when the fire smoked. ‘I am a lone lorn creetur’,’ were Mrs. Gummidge’s words, when that unpleasant occurrence took place, ‘and everythink goes contrary with me.’
+‘Oh, it’ll soon leave off,’ said Peggotty—I again mean our Peggotty—‘and besides, you know, it’s not more disagreeable to you than to us.’
+‘I feel it more,’ said Mrs. Gummidge.
+It was a very cold day, with cutting blasts of wind. Mrs. Gummidge’s peculiar corner of the fireside seemed to me to be the warmest and snuggest in the place, as her chair was certainly the easiest, but it didn’t suit her that day at all. She was constantly complaining of the cold, and of its occasioning a visitation in her back which she called ‘the creeps’. At last she shed tears on that subject, and said again that she was ‘a lone lorn creetur’ and everythink went contrary with her’.
+‘It is certainly very cold,’ said Peggotty. ‘Everybody must feel it so.’
+‘I feel it more than other people,’ said Mrs. Gummidge.
+So at dinner; when Mrs. Gummidge was always helped immediately after me, to whom the preference was given as a visitor of distinction. The fish were small and bony, and the potatoes were a little burnt. We all acknowledged that we felt this something of a disappointment; but Mrs. Gummidge said she felt it more than we did, and shed tears again, and made that former declaration with great bitterness.
+Accordingly, when Mr. Peggotty came home about nine o’clock, this unfortunate Mrs. Gummidge was knitting in her corner, in a very wretched and miserable condition. Peggotty had been working cheerfully. Ham had been patching up a great pair of waterboots; and I, with little Em’ly by my side, had been reading to them. Mrs. Gummidge had never made any other remark than a forlorn sigh, and had never raised her eyes since tea.
+‘Well, Mates,’ said Mr. Peggotty, taking his seat, ‘and how are you?’
+We all said something, or looked something, to welcome him, except Mrs. Gummidge, who only shook her head over her knitting.
+‘What’s amiss?’ said Mr. Peggotty, with a clap of his hands. ‘Cheer up, old Mawther!’ (Mr. Peggotty meant old girl.)
+Mrs. Gummidge did not appear to be able to cheer up. She took out an old black silk handkerchief and wiped her eyes; but instead of putting it in her pocket, kept it out, and wiped them again, and still kept it out, ready for use.
+‘What’s amiss, dame?’ said Mr. Peggotty.
+‘Nothing,’ returned Mrs. Gummidge. ‘You’ve come from The Willing Mind, Dan’l?’
+‘Why yes, I’ve took a short spell at The Willing Mind tonight,’ said Mr. Peggotty.
+‘I’m sorry I should drive you there,’ said Mrs. Gummidge.
+‘Drive! I don’t want no driving,’ returned Mr. Peggotty with an honest laugh. ‘I only go too ready.’
+‘Very ready,’ said Mrs. Gummidge, shaking her head, and wiping her eyes. ‘Yes, yes, very ready. I am sorry it should be along of me that you’re so ready.’
+‘Along o’ you! It an’t along o’ you!’ said Mr. Peggotty. ‘Don’t ye believe a bit on it.’
+‘Yes, yes, it is,’ cried Mrs. Gummidge. ‘I know what I am. I know that I am a lone lorn creetur’, and not only that everythink goes contrary with me, but that I go contrary with everybody. Yes, yes. I feel more than other people do, and I show it more. It’s my misfortun’.’
+I really couldn’t help thinking, as I sat taking in all this, that the misfortune extended to some other members of that family besides Mrs. Gummidge. But Mr. Peggotty made no such retort, only answering with another entreaty to Mrs. Gummidge to cheer up.
+‘I an’t what I could wish myself to be,’ said Mrs. Gummidge. ‘I am far from it. I know what I am. My troubles has made me contrary. I feel my troubles, and they make me contrary. I wish I didn’t feel ‘em, but I do. I wish I could be hardened to ‘em, but I an’t. I make the house uncomfortable. I don’t wonder at it. I’ve made your sister so all day, and Master Davy.’
+Here I was suddenly melted, and roared out, ‘No, you haven’t, Mrs. Gummidge,’ in great mental distress.
+‘It’s far from right that I should do it,’ said Mrs. Gummidge. ‘It an’t a fit return. I had better go into the house and die. I am a lone lorn creetur’, and had much better not make myself contrary here. If thinks must go contrary with me, and I must go contrary myself, let me go contrary in my parish. Dan’l, I’d better go into the house, and die and be a riddance!’
+Mrs. Gummidge retired with these words, and betook herself to bed. When she was gone, Mr. Peggotty, who had not exhibited a trace of any feeling but the profoundest sympathy, looked round upon us, and nodding his head with a lively expression of that sentiment still animating his face, said in a whisper:
+‘She’s been thinking of the old ‘un!’
+I did not quite understand what old one Mrs. Gummidge was supposed to have fixed her mind upon, until Peggotty, on seeing me to bed, explained that it was the late Mr. Gummidge; and that her brother always took that for a received truth on such occasions, and that it always had a moving effect upon him. Some time after he was in his hammock that night, I heard him myself repeat to Ham, ‘Poor thing! She’s been thinking of the old ‘un!’ And whenever Mrs. Gummidge was overcome in a similar manner during the remainder of our stay (which happened some few times), he always said the same thing in extenuation of the circumstance, and always with the tenderest commiseration.
+So the fortnight slipped away, varied by nothing but the variation of the tide, which altered Mr. Peggotty’s times of going out and coming in, and altered Ham’s engagements also. When the latter was unemployed, he sometimes walked with us to show us the boats and ships, and once or twice he took us for a row. I don’t know why one slight set of impressions should be more particularly associated with a place than another, though I believe this obtains with most people, in reference especially to the associations of their childhood. I never hear the name, or read the name, of Yarmouth, but I am reminded of a certain Sunday morning on the beach, the bells ringing for church, little Em’ly leaning on my shoulder, Ham lazily dropping stones into the water, and the sun, away at sea, just breaking through the heavy mist, and showing us the ships, like their own shadows.
+At last the day came for going home. I bore up against the separation from Mr. Peggotty and Mrs. Gummidge, but my agony of mind at leaving little Em’ly was piercing. We went arm-in-arm to the public-house where the carrier put up, and I promised, on the road, to write to her. (I redeemed that promise afterwards, in characters larger than those in which apartments are usually announced in manuscript, as being to let.) We were greatly overcome at parting; and if ever, in my life, I have had a void made in my heart, I had one made that day.
+Now, all the time I had been on my visit, I had been ungrateful to my home again, and had thought little or nothing about it. But I was no sooner turned towards it, than my reproachful young conscience seemed to point that way with a ready finger; and I felt, all the more for the sinking of my spirits, that it was my nest, and that my mother was my comforter and friend.
+This gained upon me as we went along; so that the nearer we drew, the more familiar the objects became that we passed, the more excited I was to get there, and to run into her arms. But Peggotty, instead of sharing in those transports, tried to check them (though very kindly), and looked confused and out of sorts.
+Blunderstone Rookery would come, however, in spite of her, when the carrier’s horse pleased—and did. How well I recollect it, on a cold grey afternoon, with a dull sky, threatening rain!
+The door opened, and I looked, half laughing and half crying in my pleasant agitation, for my mother. It was not she, but a strange servant.
+‘Why, Peggotty!’ I said, ruefully, ‘isn’t she come home?’
+‘Yes, yes, Master Davy,’ said Peggotty. ‘She’s come home. Wait a bit, Master Davy, and I’ll—I’ll tell you something.’
+Between her agitation, and her natural awkwardness in getting out of the cart, Peggotty was making a most extraordinary festoon of herself, but I felt too blank and strange to tell her so. When she had got down, she took me by the hand; led me, wondering, into the kitchen; and shut the door.
+‘Peggotty!’ said I, quite frightened. ‘What’s the matter?’
+‘Nothing’s the matter, bless you, Master Davy dear!’ she answered, assuming an air of sprightliness.
+‘Something’s the matter, I’m sure. Where’s mama?’
+‘Where’s mama, Master Davy?’ repeated Peggotty.
+‘Yes. Why hasn’t she come out to the gate, and what have we come in here for? Oh, Peggotty!’ My eyes were full, and I felt as if I were going to tumble down.
+‘Bless the precious boy!’ cried Peggotty, taking hold of me. ‘What is it? Speak, my pet!’
+‘Not dead, too! Oh, she’s not dead, Peggotty?’
+Peggotty cried out No! with an astonishing volume of voice; and then sat down, and began to pant, and said I had given her a turn.
+I gave her a hug to take away the turn, or to give her another turn in the right direction, and then stood before her, looking at her in anxious inquiry.
+‘You see, dear, I should have told you before now,’ said Peggotty, ‘but I hadn’t an opportunity. I ought to have made it, perhaps, but I couldn’t azackly’—that was always the substitute for exactly, in Peggotty’s militia of words—‘bring my mind to it.’
+‘Go on, Peggotty,’ said I, more frightened than before.
+‘Master Davy,’ said Peggotty, untying her bonnet with a shaking hand, and speaking in a breathless sort of way. ‘What do you think? You have got a Pa!’
+I trembled, and turned white. Something—I don’t know what, or how—connected with the grave in the churchyard, and the raising of the dead, seemed to strike me like an unwholesome wind.
+‘A new one,’ said Peggotty.
+‘A new one?’ I repeated.
+Peggotty gave a gasp, as if she were swallowing something that was very hard, and, putting out her hand, said:
+‘Come and see him.’
+‘I don’t want to see him.’ —‘And your mama,’ said Peggotty.
+I ceased to draw back, and we went straight to the best parlour, where she left me. On one side of the fire, sat my mother; on the other, Mr. Murdstone. My mother dropped her work, and arose hurriedly, but timidly I thought.
+‘Now, Clara my dear,’ said Mr. Murdstone. ‘Recollect! control yourself, always control yourself! Davy boy, how do you do?’
+I gave him my hand. After a moment of suspense, I went and kissed my mother: she kissed me, patted me gently on the shoulder, and sat down again to her work. I could not look at her, I could not look at him, I knew quite well that he was looking at us both; and I turned to the window and looked out there, at some shrubs that were drooping their heads in the cold.
+As soon as I could creep away, I crept upstairs. My old dear bedroom was changed, and I was to lie a long way off. I rambled downstairs to find anything that was like itself, so altered it all seemed; and roamed into the yard. I very soon started back from there, for the empty dog-kennel was filled up with a great dog—deep mouthed and black-haired like Him—and he was very angry at the sight of me, and sprang out to get at me.
+`;
+
+    </script>
+</head>
+
+
+
+<body onload="go()">
+
+</body>
+ 
+All the exciting stuff is in the console. Bye now!
+
+</html>
