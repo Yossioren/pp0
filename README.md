@@ -11,3 +11,5 @@ Artifact Repository for the paper "Prime+Probe 1, JavaScript 0: Overcoming Brows
 Our classification over real data can be viewed using the interactive Python notebook at the following link:
 
 (TBD)
+
+For more information, and to download the paper, visit: https://orenlab.sise.bgu.ac.il/p/PP0
