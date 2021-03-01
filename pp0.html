@@ -6,11 +6,9 @@
         // Artifact repository for PP0 - for more information see
         // https://github.com/yossioren/pp0
 
-        const COUNT_SWEEPS = true; // if false, measure time. if true, measure how many cache sweeps we get until the clock changes
+        const COUNT_SWEEPS = false; // if false, measure time. if true, measure how many cache sweeps we get until the clock changes
         const USE_ARRAYS = true; // if true, use ByteArrays. If false, just use a large string.
         const USE_WEBSOCKETS = false; // if true, don't measure time directly, use the WebSockets server instead
-
-        // general constants
         const WEBSOCKET_URL = "ws://cyberlogs.oy.ne.ro:8080/"; 
 
         // Cache size constants.
@@ -19,8 +17,8 @@
 
         // To try out COUNT_SWEEPS mode (e.g. on the Tor Browser), 
         // increase SAMPLING_PERIOD_IN_MS to 100 and reduce MEASUREMENT_COUNT accordingly
-        const MEASUREMENT_COUNT = 10;
-        const SAMPLING_PERIOD_IN_MS = 100;
+        const MEASUREMENT_COUNT = 500;
+        const SAMPLING_PERIOD_IN_MS = 2;
 
         const BYTES_PER_MB = 1024 * 1024;
         const BYTES_PER_LINE = 64;
@@ -152,6 +150,7 @@
                 websocket.onmessage = function (event) {
                     resultArray = event.data;
                     console.log('Trace returned: ' + resultArray);
+                    document.getElementById("results").innerHTML = resultArray;
                 }
 
                 websocket.onopen = function () {
@@ -246,6 +245,7 @@
             // If this is a WebSockets measurement, get the reading from the server
             if (USE_WEBSOCKETS == false) {
                 console.log('Trace returned: ' + resultArray);
+                document.getElementById("results").innerHTML = resultArray;
             } else {
                 // The socket server will send us the trace
                 websocket.send('END');
@@ -714,6 +714,7 @@ As soon as I could creep away, I crept upstairs. My old dear bedroom was changed
 
 </body>
  
-All the exciting stuff is in the console. Bye now!
-
+<div id="results" style="width:100%; word-wrap: break-word;"></div>
+<br>
+<a href="https://github.com/Yossioren/pp0">For more information</a>
 </html>
