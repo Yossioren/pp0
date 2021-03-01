@@ -3,8 +3,8 @@ Artifact Repository for the paper "Prime+Probe 1, JavaScript 0: Overcoming Brows
 
 ## Demo Attack Pages
 
-* [**Cache contention, count sweeps, and String and Sock**](https://pp0.github.io/pp0/pp0.html) 
-* [**CSS PP0**](https://pp0.github.io/pp0/pp0.html) 
+* [**Cache contention, count sweeps, and String and Sock**](https://orenlab.sise.bgu.ac.il/pp0/pp0.html) 
+* [**CSS PP0**](https://orenlab.sise.bgu.ac.il/pp0/pp0-css.html) 
 
 ## Python notebook
 
