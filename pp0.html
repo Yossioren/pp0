@@ -99,7 +99,7 @@
 
             this.createSetHeads = function (sets, ways) {
                 var unshuffledArray = new Uint32Array(sets / SETS_PER_PAGE);
-                var allSetOffset = Math.log2(sets) + 4; // 17 for sets=8192, 16 for sets=4096
+                var allSetOffset = Math.ceil(Math.log2(sets)) + 4; // 17 for sets=8192, 16 for sets=4096
                 var i;
                 for (i = 0; i < unshuffledArray.length; i++) {
                     unshuffledArray[i] = i;
